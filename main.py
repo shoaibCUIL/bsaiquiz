@@ -9,7 +9,199 @@ import hashlib
 import json
 import time
 import random
+import os
+import io
 from datetime import datetime
+import openpyxl
+from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+from openpyxl.utils import get_column_letter
+
+# ── Persistent storage helpers ───────────────────────────────────────────────
+# Results are saved to a local JSON file so they survive server restarts.
+RESULTS_FILE = "quiz_results.json"
+
+def load_all_results() -> dict:
+    """Load all student results from disk."""
+    if os.path.exists(RESULTS_FILE):
+        try:
+            with open(RESULTS_FILE, "r") as f:
+                return json.load(f)
+        except Exception:
+            return {}
+    return {}
+
+def save_result(roll: str, name: str, quiz_name: str, score_data: dict):
+    """Persist a student's quiz result to disk."""
+    all_results = load_all_results()
+    if roll not in all_results:
+        all_results[roll] = {"name": name, "roll": roll, "quizzes": {}}
+    # Strip non-serialisable objects (question dicts with lists etc.)
+    safe_detail = []
+    for item in score_data.get("detail", []):
+        safe_detail.append({
+            "q_text": item["q"]["text"],
+            "q_type": item["q"]["type"],
+            "ans":    item["ans"],
+            "score":  item["score"],
+            "max":    item["max"],
+        })
+    all_results[roll]["quizzes"][quiz_name] = {
+        "auto_score":    score_data["auto_score"],
+        "auto_total":    score_data["auto_total"],
+        "elapsed":       score_data.get("elapsed", 0),
+        "submitted_at":  score_data.get("submitted_at", ""),
+        "detail":        safe_detail,
+    }
+    with open(RESULTS_FILE, "w") as f:
+        json.dump(all_results, f, indent=2)
+
+def is_quiz_locked(roll: str, quiz_name: str) -> bool:
+    """Return True if this student already submitted this quiz."""
+    all_results = load_all_results()
+    return roll in all_results and quiz_name in all_results[roll].get("quizzes", {})
+
+def generate_excel() -> bytes:
+    """Build a styled Excel report of all student results and return as bytes."""
+    all_results = load_all_results()
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Quiz Results"
+
+    # ── Colour palette ───────────────────────────────────────────────────
+    HDR_BG   = PatternFill("solid", fgColor="0D1B2A")
+    HDR_FG   = Font(bold=True, color="E8A020", size=11)
+    SUB_BG   = PatternFill("solid", fgColor="1B7F79")
+    SUB_FG   = Font(bold=True, color="FFFFFF", size=10)
+    ALT_BG   = PatternFill("solid", fgColor="EAF6F6")
+    GOOD_BG  = PatternFill("solid", fgColor="D5F5E3")
+    BAD_BG   = PatternFill("solid", fgColor="FADBD8")
+    MID_BG   = PatternFill("solid", fgColor="FEF9E7")
+    thin     = Side(style="thin", color="CCCCCC")
+    border   = Border(left=thin, right=thin, top=thin, bottom=thin)
+    center   = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    left     = Alignment(horizontal="left",   vertical="center", wrap_text=True)
+
+    QUIZ_NAMES = list(QUIZZES.keys())
+    Q1 = QUIZ_NAMES[0] if len(QUIZ_NAMES) > 0 else "Quiz 1"
+    Q2 = QUIZ_NAMES[1] if len(QUIZ_NAMES) > 1 else "Quiz 2"
+
+    # ── Title row ────────────────────────────────────────────────────────
+    ws.merge_cells("A1:L1")
+    title_cell = ws["A1"]
+    title_cell.value = "Modern Grammar Quiz — BS AI SP26 | COMSATS University Lahore"
+    title_cell.font  = Font(bold=True, color="FFFFFF", size=13)
+    title_cell.fill  = HDR_BG
+    title_cell.alignment = center
+    ws.row_dimensions[1].height = 30
+
+    # ── Sub-header ───────────────────────────────────────────────────────
+    ws.merge_cells("A2:L2")
+    sub = ws["A2"]
+    sub.value = f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M')}  |  By Muhammad Shoaib Tahir"
+    sub.font  = Font(italic=True, color="555555", size=10)
+    sub.alignment = center
+    ws.row_dimensions[2].height = 18
+
+    # ── Column headers ───────────────────────────────────────────────────
+    headers = [
+        "S.No", "Roll Number", "Student Name",
+        f"Quiz 1\nMCQ+Fill\n(/13)", f"Quiz 1\nShort Q\n(/4 manual)", f"Quiz 1\nTime",
+        f"Quiz 2\nMCQ+Fill\n(/13)", f"Quiz 2\nShort Q\n(/4 manual)", f"Quiz 2\nTime",
+        "Total Auto\n(/26)", "Grade", "Status"
+    ]
+    ws.row_dimensions[3].height = 40
+    for col_i, h in enumerate(headers, start=1):
+        cell = ws.cell(row=3, column=col_i, value=h)
+        cell.font      = SUB_FG
+        cell.fill      = SUB_BG
+        cell.alignment = center
+        cell.border    = border
+
+    # ── Column widths ────────────────────────────────────────────────────
+    col_widths = [6, 20, 28, 14, 16, 10, 14, 16, 10, 12, 8, 14]
+    for i, w in enumerate(col_widths, start=1):
+        ws.column_dimensions[get_column_letter(i)].width = w
+
+    # ── Data rows ────────────────────────────────────────────────────────
+    sno = 1
+    for roll, sdata in sorted(all_results.items()):
+        name     = sdata.get("name", "")
+        quizzes  = sdata.get("quizzes", {})
+
+        q1_data  = quizzes.get(Q1, {})
+        q2_data  = quizzes.get(Q2, {})
+
+        q1_auto  = q1_data.get("auto_score", "—")
+        q2_auto  = q2_data.get("auto_score", "—")
+
+        # count short answers
+        def count_short(qdata):
+            return sum(1 for d in qdata.get("detail", []) if d["q_type"] == "short")
+
+        q1_short_count = count_short(q1_data)
+        q2_short_count = count_short(q2_data)
+
+        def fmt_elapsed(sec):
+            if not sec: return "—"
+            m, s = divmod(int(sec), 60)
+            return f"{m:02d}:{s:02d}"
+
+        q1_time  = fmt_elapsed(q1_data.get("elapsed"))
+        q2_time  = fmt_elapsed(q2_data.get("elapsed"))
+
+        total_auto = 0
+        if isinstance(q1_auto, (int, float)): total_auto += q1_auto
+        if isinstance(q2_auto, (int, float)): total_auto += q2_auto
+        total_str = f"{total_auto:.1f}" if (isinstance(q1_auto,(int,float)) or isinstance(q2_auto,(int,float))) else "—"
+
+        pct = (total_auto / 26 * 100) if isinstance(total_auto, (int,float)) else 0
+        grade = "A+" if pct>=90 else "A" if pct>=80 else "B" if pct>=70 else "C" if pct>=60 else "D" if pct>=50 else "F"
+        both_done = bool(q1_data) and bool(q2_data)
+        status = "✅ Both Done" if both_done else ("⏳ Quiz 1 Only" if q1_data else ("⏳ Quiz 2 Only" if q2_data else "❌ Not Started"))
+
+        row_vals = [
+            sno, roll.upper(), name,
+            f"{q1_auto:.1f}" if isinstance(q1_auto, (int,float)) else "—",
+            f"— / {q1_short_count*2} pending" if q1_short_count else "—",
+            q1_time,
+            f"{q2_auto:.1f}" if isinstance(q2_auto, (int,float)) else "—",
+            f"— / {q2_short_count*2} pending" if q2_short_count else "—",
+            q2_time,
+            total_str, grade, status
+        ]
+
+        row_num  = sno + 3
+        bg_fill  = ALT_BG if sno % 2 == 0 else None
+        grade_fill = GOOD_BG if pct >= 70 else (MID_BG if pct >= 50 else BAD_BG)
+
+        for col_i, val in enumerate(row_vals, start=1):
+            cell = ws.cell(row=row_num, column=col_i, value=val)
+            cell.alignment = center if col_i != 3 else left
+            cell.border    = border
+            if col_i == 11:   # Grade column
+                cell.fill = grade_fill
+                cell.font = Font(bold=True, size=11)
+            elif bg_fill:
+                cell.fill = bg_fill
+
+        ws.row_dimensions[row_num].height = 20
+        sno += 1
+
+    # ── Summary stats at bottom ──────────────────────────────────────────
+    blank_row = sno + 4
+    ws.cell(row=blank_row, column=1, value="Summary").font = Font(bold=True, size=11, color="0D1B2A")
+    ws.cell(row=blank_row+1, column=1, value="Total Students Registered:").font = Font(bold=True)
+    ws.cell(row=blank_row+1, column=2, value=len(STUDENT_LIST))
+    ws.cell(row=blank_row+2, column=1, value="Students Submitted Both Quizzes:").font = Font(bold=True)
+    both = sum(1 for v in all_results.values() if Q1 in v.get("quizzes",{}) and Q2 in v.get("quizzes",{}))
+    ws.cell(row=blank_row+2, column=2, value=both)
+    ws.cell(row=blank_row+3, column=1, value="Students Not Started:").font = Font(bold=True)
+    ws.cell(row=blank_row+3, column=2, value=len(STUDENT_LIST) - len(all_results))
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+    return buf.getvalue()
 
 # ── Page config ─────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -601,6 +793,7 @@ defaults = {
     "confirm_submit": False,
     "start_time": None,
     "completed_quizzes": [],
+    "locked_quizzes": [],      # quizzes locked from disk (one-time login)
 }
 for k, v in defaults.items():
     if k not in st.session_state:
@@ -649,16 +842,25 @@ if st.session_state.page == "login":
             )
         else:
             expected_name = STUDENT_LIST[roll_clean]
-            # fuzzy check — first word of name must match
             if name_clean.split()[0] not in expected_name:
                 st.error(
-                    f"⚠️ Name does not match roll number. "
-                    f"Expected name starting with the registered first name. "
-                    f"Please verify your credentials."
+                    "⚠️ Name does not match roll number. "
+                    "Expected name starting with the registered first name. "
+                    "Please verify your credentials."
                 )
             else:
-                st.session_state.student_name = expected_name
-                st.session_state.student_roll = roll_clean
+                # ── Load any previously saved results for this student ──
+                all_results = load_all_results()
+                student_saved = all_results.get(roll_clean, {}).get("quizzes", {})
+                locked = [qn for qn in QUIZZES if qn in student_saved]
+
+                st.session_state.student_name      = expected_name
+                st.session_state.student_roll      = roll_clean
+                st.session_state.completed_quizzes = locked
+                st.session_state.locked_quizzes    = locked
+                # Restore score summaries so result page works after re-login
+                for qn in locked:
+                    st.session_state.scores[qn] = student_saved[qn]
                 st.session_state.page = "quiz_select"
                 st.rerun()
 
@@ -685,38 +887,99 @@ elif st.session_state.page == "quiz_select":
     st.markdown("---")
     st.markdown("#### 📋 Choose a Quiz")
 
+    all_done = all(qn in st.session_state.locked_quizzes for qn in QUIZZES)
+
     for quiz_name, questions in QUIZZES.items():
-        done = quiz_name in st.session_state.completed_quizzes
+        locked = quiz_name in st.session_state.locked_quizzes
         col_a, col_b = st.columns([3, 1])
         with col_a:
-            emoji = "✅" if done else "📝"
-            status = " — **Completed**" if done else ""
+            emoji = "🔒" if locked else "📝"
+            status = " — **Submitted (Locked)**" if locked else ""
             st.markdown(f"**{emoji} {quiz_name}**{status}")
-            st.caption(f"15 questions • 10 MCQ • 3 Fill in the Blank • 2 Short Answer")
+            if locked:
+                st.caption("✅ Already submitted — one attempt allowed per quiz.")
+            else:
+                st.caption("15 questions • 10 MCQ • 3 Fill in the Blank • 2 Short Answer")
         with col_b:
-            if done:
+            if locked:
                 score_info = st.session_state.scores.get(quiz_name, {})
-                auto = score_info.get("auto_score", 0)
+                auto  = score_info.get("auto_score", 0)
                 total = score_info.get("auto_total", 13)
-                st.markdown(f"**Score:** {auto:.1f}/{total}")
+                st.markdown(
+                    f'<div style="background:#1b7f79;color:white;padding:0.5rem 0.8rem;'
+                    f'border-radius:8px;text-align:center;font-weight:700;">'
+                    f'Score<br>{auto:.1f}/{total}</div>',
+                    unsafe_allow_html=True,
+                )
             else:
                 if st.button("Start →", key=f"start_{quiz_name}"):
                     seed = get_seed(st.session_state.student_roll, quiz_name)
-                    st.session_state.active_quiz = quiz_name
-                    st.session_state.shuffled_qs = shuffle_questions(questions, seed)
-                    st.session_state.answers = {}
-                    st.session_state.q_index = 0
-                    st.session_state.submitted = False
+                    st.session_state.active_quiz    = quiz_name
+                    st.session_state.shuffled_qs    = shuffle_questions(questions, seed)
+                    st.session_state.answers        = {}
+                    st.session_state.q_index        = 0
+                    st.session_state.submitted      = False
                     st.session_state.confirm_submit = False
-                    st.session_state.start_time = time.time()
-                    st.session_state.page = "quiz"
+                    st.session_state.start_time     = time.time()
+                    st.session_state.page           = "quiz"
                     st.rerun()
         st.markdown("---")
 
-    if st.session_state.completed_quizzes:
+    # View results button
+    if st.session_state.locked_quizzes:
         if st.button("📊 View My Results", use_container_width=True):
+            st.session_state.active_quiz = st.session_state.locked_quizzes[-1]
             st.session_state.page = "result"
             st.rerun()
+
+    # ── INSTRUCTOR PANEL ─────────────────────────────────────────────────
+    st.markdown("<br>", unsafe_allow_html=True)
+    with st.expander("🔐 Instructor Panel — Download Results"):
+        pwd = st.text_input("Enter instructor password:", type="password", key="inst_pwd")
+        if pwd == "mstshoaib2024":   # change this password as needed
+            all_results = load_all_results()
+            submitted_count = len(all_results)
+            total_students  = len(STUDENT_LIST)
+            st.success(f"✅ Access granted — {submitted_count}/{total_students} students have submitted.")
+
+            col_x, col_y = st.columns(2)
+            with col_x:
+                excel_bytes = generate_excel()
+                st.download_button(
+                    label="📥 Download Excel Report",
+                    data=excel_bytes,
+                    file_name=f"BSAI_Grammar_Quiz_Results_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    use_container_width=True,
+                )
+            with col_y:
+                json_str = json.dumps(all_results, indent=2)
+                st.download_button(
+                    label="📥 Download Raw JSON",
+                    data=json_str,
+                    file_name="quiz_results_raw.json",
+                    mime="application/json",
+                    use_container_width=True,
+                )
+
+            # Quick table preview
+            st.markdown("**Quick Preview:**")
+            preview_rows = []
+            for roll, sdata in sorted(all_results.items()):
+                q1 = sdata["quizzes"].get(list(QUIZZES.keys())[0], {})
+                q2 = sdata["quizzes"].get(list(QUIZZES.keys())[1], {}) if len(QUIZZES) > 1 else {}
+                preview_rows.append({
+                    "Roll": roll.upper(),
+                    "Name": sdata.get("name",""),
+                    "Quiz1 Auto": f"{q1.get('auto_score','—')}/{q1.get('auto_total','—')}" if q1 else "Not done",
+                    "Quiz2 Auto": f"{q2.get('auto_score','—')}/{q2.get('auto_total','—')}" if q2 else "Not done",
+                    "Submitted At (Q1)": q1.get("submitted_at","—"),
+                })
+            import pandas as pd
+            if preview_rows:
+                st.dataframe(pd.DataFrame(preview_rows), use_container_width=True)
+        elif pwd:
+            st.error("❌ Wrong password.")
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -892,15 +1155,25 @@ elif st.session_state.page == "quiz":
                         detail.append({"q": _q, "ans": _ans, "score": None, "max": 2})
 
                 elapsed_final = int(time.time() - (st.session_state.start_time or time.time()))
-                st.session_state.scores[quiz_name] = {
-                    "auto_score": auto_score,
-                    "auto_total": auto_total,
-                    "detail": detail,
-                    "elapsed": elapsed_final,
+                score_payload = {
+                    "auto_score":   auto_score,
+                    "auto_total":   auto_total,
+                    "detail":       detail,
+                    "elapsed":      elapsed_final,
                     "submitted_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                 }
+                st.session_state.scores[quiz_name] = score_payload
                 if quiz_name not in st.session_state.completed_quizzes:
                     st.session_state.completed_quizzes.append(quiz_name)
+                if quiz_name not in st.session_state.locked_quizzes:
+                    st.session_state.locked_quizzes.append(quiz_name)
+                # ── Persist to disk — one-time lock ──────────────────────
+                save_result(
+                    st.session_state.student_roll,
+                    st.session_state.student_name,
+                    quiz_name,
+                    score_payload,
+                )
                 st.session_state.submitted = True
                 st.session_state.page = "result"
                 st.rerun()
